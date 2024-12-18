@@ -1,0 +1,331 @@
+/**
+ * API 封装模块
+ *
+ * 封装与后端的所有 HTTP 交互，包括：
+ *   - 普通 REST 请求（会话列表、消息历史、删除会话、工具列表）
+ *   - SSE 流式聊天请求（POST + text/event-stream）
+ *
+ * 所有 REST 接口返回统一格式: { code, msg, data, extra }
+ *   - code === 0 表示成功，其他值表示失败
+ *   - data 承载主数据，extra 承载附加信息
+ *
+ * 所有请求通过 Vite 代理 /api → http://localhost:8001/api 转发到后端。
+ */
+
+const BASE = '/api'
+
+// ============================================
+// 统一请求封装
+// ============================================
+
+/**
+ * 统一 REST 请求函数
+ *
+ * 自动解包后端的 ApiResponse 格式：
+ *   - code === 0 → 返回完整的响应对象 { code, msg, data, extra }
+ *   - code !== 0 → 抛出 Error（message 为后端返回的 msg）
+ *
+ * 调用方通过 result.data 获取主数据，result.extra 获取附加信息。
+ */
+async function request(url, options) {
+  const res = await fetch(url, options)
+  const json = await res.json()
+  if (json.code !== 0) {
+    throw new Error(json.msg || '请求失败')
+  }
+  return json
+}
+
+// ============================================
+// 普通 REST 请求
+// ============================================
+
+/** 获取所有会话列表（按更新时间倒序） */
+export async function fetchConversations() {
+  const result = await request(`${BASE}/conversations`)
+  return result.data
+}
+
+/** 获取指定会话的消息历史 */
+export async function fetchHistory(conversationId) {
+  const result = await request(`${BASE}/messages/${conversationId}`)
+  return result.data
+}
+
+/** 删除指定会话 */
+export async function deleteConversation(conversationId) {
+  await request(`${BASE}/conversations/${conversationId}/delete`, {
+    method: 'POST',
+  })
+}
+
+/**
+ * 清空指定会话的消息历史（保留会话本身）
+ *
+ * 删除 checkpointer 中该会话的对话上下文，LLM 将丧失记忆。
+ * 会话条目保留在侧边栏列表中。
+ */
+export async function clearConversationMessages(conversationId) {
+  await request(`${BASE}/conversations/${conversationId}/messages/clear`, {
+    method: 'POST',
+  })
+}
+
+/**
+ * 批量删除消息（单条删除时传入单元素数组即可）
+ *
+ * 删除最早匹配消息及其之后的所有消息（级联删除）。
+ * 返回 { deleted_count: 3 } 表示实际删除了3条。
+ *
+ * @param {string} conversationId - 会话 ID
+ * @param {string[]} messageIds - 要删除的消息 ID 列表
+ * @returns {Promise<{deleted_count: number}>}
+ */
+export async function batchDeleteMessages(conversationId, messageIds) {
+  const result = await request(
+    `${BASE}/conversations/${conversationId}/messages/batch-delete`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message_ids: messageIds }),
+    }
+  )
+  return result.data
+}
+
+/**
+ * 重命名指定会话
+ *
+ * POST /api/conversations/{id}/rename，仅更新会话标题。
+ */
+export async function renameConversation(conversationId, title) {
+  await request(`${BASE}/conversations/${conversationId}/rename`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  })
+}
+
+/**
+ * 顶置指定会话
+ *
+ * POST /api/conversations/{id}/pin，将会话排到列表最前面。
+ * 已顶置的会话再次调用会刷新顶置时间。
+ */
+export async function pinConversation(conversationId) {
+  await request(`${BASE}/conversations/${conversationId}/pin`, {
+    method: 'POST',
+  })
+}
+
+/**
+ * 取消顶置指定会话
+ *
+ * POST /api/conversations/{id}/unpin，恢复按更新时间排序。
+ */
+export async function unpinConversation(conversationId) {
+  await request(`${BASE}/conversations/${conversationId}/unpin`, {
+    method: 'POST',
+  })
+}
+
+/** 获取所有可用工具列表 */
+export async function fetchTools() {
+  const result = await request(`${BASE}/tools`)
+  return result.data
+}
+
+/**
+ * 热重载 MCP 工具（POST /api/tools/reload）
+ *
+ * 通知后端重新读取 mcp_servers.json 配置文件，
+ * 清除旧的 MCP 工具并重新加载，无需重启服务。
+ * 返回 { cleared, loaded, total } 附加信息。
+ */
+export async function reloadTools() {
+  const result = await request(`${BASE}/tools/reload`, { method: 'POST' })
+  return result.extra
+}
+
+// ============================================
+// 配置管理（LLM 大模型配置）
+// ============================================
+
+/**
+ * 获取当前 LLM 配置
+ *
+ * GET /api/config/llm，返回脱敏后的 API 密钥和当前配置。
+ * 用于打开设置弹窗时填充表单。
+ */
+export async function fetchLlmConfig() {
+  const result = await request(`${BASE}/config/llm`)
+  return result.data
+}
+
+/**
+ * 保存 LLM 配置到 .env 文件
+ *
+ * POST /api/config/llm，将新的 API 地址、密钥、模型名称写入 .env。
+ * api_key 为空字符串时后端不覆盖现有密钥。
+ * 注意：修改后需重启后端服务才能生效。
+ *
+ * @param {Object} config - { base_url, api_key, model_name }
+ */
+export async function saveLlmConfig(config) {
+  const result = await request(`${BASE}/config/llm`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  })
+  return result.msg
+}
+
+// ============================================
+// 配置管理（中间件配置）
+// ============================================
+
+/**
+ * 获取当前中间件配置
+ *
+ * GET /api/config/middleware，返回摘要压缩等中间件的配置状态。
+ * 用于打开设置弹窗"对话压缩"板块时填充表单。
+ */
+export async function fetchMiddlewareConfig() {
+  const result = await request(`${BASE}/config/middleware`)
+  return result.data
+}
+
+/**
+ * 保存中间件配置到 .env 文件
+ *
+ * POST /api/config/middleware，将摘要压缩配置写入 .env 并热重载。
+ *
+ * @param {Object} config - { summary_enabled, summary_model, summary_max_tokens, summary_messages_to_keep }
+ */
+export async function saveMiddlewareConfig(config) {
+  const result = await request(`${BASE}/config/middleware`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  })
+  return result.msg
+}
+
+// ============================================
+// SSE 流式聊天请求
+// ============================================
+
+/**
+ * 发送聊天消息并通过 SSE 接收流式响应
+ *
+ * 实现原理：
+ *   1. 使用 fetch POST 发送请求（body 包含消息、会话ID、选定工具）
+ *   2. 响应为 text/event-stream 格式，通过 ReadableStream 逐块读取
+ *   3. 按 SSE 协议解析（event: xxx \n data: yyy \n\n），回调 onEvent
+ *
+ * SSE 事件类型：
+ *   - start:       对话开始（data.conversation_id）
+ *   - token:       流式文本 token（data.content）
+ *   - thinking:    工具开始调用时立即推送（data.tool / args，observation=null）
+ *   - tool_result: 工具执行完毕后推送结果（data.tool / args / observation）
+ *   - done:        对话结束（data.conversation_id / reply）
+ *   - error:       错误信息（data.content）
+ *
+ * @param {Object} payload - { message, conversation_id, selected_tools }
+ * @param {Function} onEvent - 事件回调 (eventType: string, data: object) => void
+ * @param {AbortSignal} signal - 用于取消请求的信号（来自 AbortController）
+ */
+/**
+ * 提交人工审批决策并通过 SSE 接收后续流式响应
+ *
+ * 当 POST /api/chat 返回 approval_required 事件后调用此函数。
+ * 将用户的审批决策发送给后端，后端恢复 Agent 执行并继续推送 SSE 事件。
+ * 返回的 SSE 事件格式与 chatStream 完全一致。
+ *
+ * @param {Object} payload - { conversation_id, decisions: [{type, edited_action?, message?}] }
+ * @param {Function} onEvent - 事件回调 (eventType, data) => void
+ * @param {AbortSignal} signal - 取消信号
+ */
+export async function submitDecisions(payload, onEvent, signal) {
+  const response = await fetch(`${BASE}/chat/decide`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal,
+  })
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+
+    buffer += decoder.decode(value, { stream: true })
+    const events = buffer.split('\n\n')
+    buffer = events.pop()
+
+    for (const eventStr of events) {
+      if (!eventStr.trim()) continue
+      let eventType = ''
+      let data = ''
+      for (const line of eventStr.split('\n')) {
+        if (line.startsWith('event: ')) eventType = line.slice(7).trim()
+        else if (line.startsWith('data: ')) data = line.slice(6)
+      }
+      if (eventType && data) {
+        try { onEvent(eventType, JSON.parse(data)) }
+        catch (e) { console.error('SSE parse error:', e, eventStr) }
+      }
+    }
+  }
+}
+
+export async function chatStream(payload, onEvent, signal) {
+  const response = await fetch(`${BASE}/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal,
+  })
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+
+    buffer += decoder.decode(value, { stream: true })
+
+    // 按双换行分割完整的 SSE 事件，保留最后一个不完整的事件
+    const events = buffer.split('\n\n')
+    buffer = events.pop()
+
+    for (const eventStr of events) {
+      if (!eventStr.trim()) continue
+
+      let eventType = ''
+      let data = ''
+
+      // 解析 event: 和 data: 行
+      for (const line of eventStr.split('\n')) {
+        if (line.startsWith('event: ')) {
+          eventType = line.slice(7).trim()
+        } else if (line.startsWith('data: ')) {
+          data = line.slice(6)
+        }
+      }
+
+      if (eventType && data) {
+        try {
+          onEvent(eventType, JSON.parse(data))
+        } catch (e) {
+          console.error('SSE parse error:', e, eventStr)
+        }
+      }
+    }
+  }
+}

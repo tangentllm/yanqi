@@ -1,0 +1,498 @@
+"""
+API 路由（统一入口）
+
+合并聊天（SSE 流式输出）、消息历史查询、会话管理和工具列表的所有接口。
+所有路由统一使用 /api 前缀，仅使用 GET 和 POST 请求方法。
+
+FastAPI 路由体系说明：
+  - APIRouter: 路由组，可以把相关的接口归到一起（类似 Java 的 Controller）
+  - @router.post/get: 路由装饰器，自动将函数注册为 API 端点
+  - Request 参数: FastAPI 自动注入的请求对象，包含 app.state 等上下文
+  - StreamingResponse: 流式响应，逐块推送数据给客户端（SSE 需要）
+
+接口列表：
+  POST /api/chat                                — 聊天（SSE 流式输出）
+  POST /api/chat/decide                         — 提交审批决策并继续执行（SSE 流式输出）
+  GET  /api/messages/{conversation_id}          — 获取会话消息历史
+  GET  /api/conversations                       — 获取所有会话列表
+  GET  /api/conversations/{id}                  — 获取会话详情
+  POST /api/conversations/{id}/rename           — 重命名会话
+  POST /api/conversations/{id}/delete           — 删除会话
+  POST /api/conversations/{id}/messages/clear   — 清空会话消息历史
+  POST /api/conversations/{id}/messages/batch-delete — 批量删除消息
+  GET  /api/tools                               — 获取可用工具列表
+  POST /api/tools/reload                        — 热重载 MCP 工具
+  GET  /api/config/llm                          — 获取当前 LLM 配置（密钥脱敏）
+  POST /api/config/llm                          — 保存 LLM 配置到 .env 文件
+  GET  /api/config/middleware                   — 获取当前中间件配置（摘要压缩等）
+  POST /api/config/middleware                   — 保存中间件配置到 .env 文件
+"""
+
+import json
+import logging
+
+# APIRouter: FastAPI 的路由分组工具（类似 Express 的 Router 或 Spring 的 @RequestMapping 前缀）
+# Request: FastAPI 的请求对象，可以访问 app.state 等上下文数据
+from fastapi import APIRouter, Request
+# StreamingResponse: 流式 HTTP 响应，服务器可以逐块推送数据（而非一次性返回）
+from fastapi.responses import StreamingResponse
+
+from entity import ChatRequest, DecideRequest, RenameRequest, LlmConfigRequest, BatchDeleteRequest, MiddlewareConfigRequest
+from entity.common.api_response import ApiResponse
+from services.config_service import ConfigService
+
+logger = logging.getLogger(__name__)
+
+# 创建路由组，prefix="/api" 表示所有路由都挂在 /api 路径下
+# 例如 @router.post("/chat") 的实际 URL 是 /api/chat
+router = APIRouter(prefix="/api")
+
+
+# ============================================
+# 聊天接口（SSE 流式输出）
+# ============================================
+@router.post("/chat")
+async def chat(request: ChatRequest, req: Request):
+    """
+    聊天接口 — 通过 Server-Sent Events (SSE) 流式返回 Agent 响应
+
+    SSE (Server-Sent Events) 是什么？
+      - 一种服务器向客户端单向推送数据的技术
+      - 基于 HTTP 长连接，比 WebSocket 简单（不需要双向通信）
+      - 格式: "event: 事件类型\\ndata: JSON数据\\n\\n"
+      - 前端用 EventSource 或 fetch + ReadableStream 接收
+
+    SSE 事件类型：
+      - start:       对话开始（包含 conversation_id）
+      - token:       流式文本 token（AI 每生成一个词就推送一次）
+      - thinking:    工具开始调用时立即推送（tool + args，observation 为空）
+      - tool_result: 工具执行完毕后推送结果（observation）
+      - done:        对话结束（包含完整的最终回复）
+      - error:       错误信息
+    """
+    # req.app.state 就是 main.py 中 lifespan 函数里挂载的全局状态
+    # agent 实例在应用启动时创建，所有请求共享同一个 agent
+    agent = req.app.state.agent
+
+    async def event_stream():
+        """
+        异步生成器：将 Agent 的事件字典转换为 SSE 格式字符串
+
+        这是一个嵌套的异步生成器函数：
+          - 外层 chat() 是 FastAPI 路由处理函数
+          - 内层 event_stream() 负责逐条生成 SSE 事件
+          - StreamingResponse 会不断从生成器取数据，实时推送给客户端
+
+        SSE 协议格式（每条消息）：
+          event: 事件类型\n
+          data: JSON数据\n
+          \n
+
+        例如：
+          event: token
+          data: {"content": "你好"}
+
+          event: token
+          data: {"content": "世界"}
+        """
+        try:
+            # agent.run() 是一个 async generator，每次 yield 一个事件字典
+            async for event in agent.run(request.model_dump()):
+                # model_dump(): Pydantic 方法，将模型转为字典（类似 Java 的 toJson()）
+                event_type = event["type"]
+                # json.dumps 将字典转为 JSON 字符串
+                # ensure_ascii=False 允许中文等非 ASCII 字符直接输出（不转义为 \uXXXX）
+                event_data = json.dumps(event["data"], ensure_ascii=False)
+                # yield: 产出数据并暂停，等待 StreamingResponse 消费后继续
+                # 末尾两个 \n 是 SSE 协议要求的消息分隔符
+                yield f"event: {event_type}\ndata: {event_data}\n\n"
+        except Exception as e:
+            logger.exception("聊天流异常")  # exception() 自动记录堆栈跟踪
+            error_data = json.dumps(
+                {"content": f"服务内部错误: {e}"}, ensure_ascii=False
+            )
+            yield f"event: error\ndata: {error_data}\n\n"
+
+    # StreamingResponse: 流式响应
+    # media_type="text/event-stream": 告诉浏览器这是 SSE 流
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ============================================
+# 审批决策（Human-in-the-Loop）
+# ============================================
+@router.post("/chat/decide")
+async def chat_decide(request: DecideRequest, req: Request):
+    """
+    提交人工审批决策并继续 Agent 执行（SSE 流式输出）
+
+    当 POST /api/chat 返回 approval_required 事件时，前端展示审批面板，
+    用户对每个待审批的工具调用做出决策后，调用此接口恢复执行。
+
+    决策类型：
+      - approve: 同意按原参数执行工具
+      - edit:    修改工具参数后执行（需附带 edited_action）
+      - reject:  拒绝执行（可附带 message 说明原因）
+      - respond: 人工消息直接作为工具返回值
+
+    恢复后 Agent 继续 ReAct 循环，可能产生更多工具调用（再次触发审批）
+    或输出最终回答。SSE 事件格式与 /api/chat 完全一致。
+
+    注意：decisions 列表的顺序必须与 approval_required 事件中 actions 列表一致。
+    """
+    agent = req.app.state.agent
+
+    async def decision_stream():
+        try:
+            async for event in agent.resume(
+                conversation_id=request.conversation_id,
+                decisions=[d.model_dump(exclude_none=True) for d in request.decisions],
+            ):
+                event_type = event["type"]
+                event_data = json.dumps(event["data"], ensure_ascii=False)
+                yield f"event: {event_type}\ndata: {event_data}\n\n"
+        except Exception as e:
+            logger.exception("审批决策流异常")
+            error_data = json.dumps(
+                {"content": f"审批决策处理异常: {e}"}, ensure_ascii=False
+            )
+            yield f"event: error\ndata: {error_data}\n\n"
+
+    return StreamingResponse(
+        decision_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ============================================
+# 消息历史
+# ============================================
+@router.get("/messages/{conversation_id}")
+async def get_messages(conversation_id: str, req: Request):
+    """
+    获取指定会话的消息历史
+
+    {conversation_id} 是路径参数（类似 Spring 的 @PathVariable）
+    FastAPI 会自动从 URL 中提取并传入函数参数。
+
+    Returns:
+        会话历史字典（包含消息列表）或错误信息
+    """
+    agent = req.app.state.agent
+    history = await agent.get_history(conversation_id)
+    if history is None:
+        return ApiResponse.fail(404, "会话不存在")
+    return ApiResponse.ok(history)
+
+
+# ============================================
+# 会话管理（CRUD 操作）
+# ============================================
+@router.get("/conversations")
+async def list_conversations(req: Request):
+    """
+    获取所有会话列表（按更新时间倒序）
+
+    前端会话列表页面调用此接口获取会话概要。
+    """
+    agent = req.app.state.agent
+    return ApiResponse.ok(await agent.get_conversations())
+
+
+@router.get("/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str, req: Request):
+    """
+    获取指定会话的详细信息（包含完整消息历史）
+
+    前端点击某个会话后调用此接口加载完整对话内容。
+    不存在时返回 ApiResponse.fail(404, ...)。
+    """
+    agent = req.app.state.agent
+    conversation = await agent.get_history(conversation_id)
+    if conversation is None:
+        return ApiResponse.fail(404, "会话不存在")
+    return ApiResponse.ok(conversation)
+
+
+@router.post("/conversations/{conversation_id}/delete")
+async def delete_conversation(conversation_id: str, req: Request):
+    """
+    删除指定会话
+
+    前端用户左滑/右键删除会话时调用。
+    不存在时返回 ApiResponse.fail(404, ...)。
+    """
+    agent = req.app.state.agent
+    success = await agent.delete_conversation(conversation_id)
+    if not success:
+        return ApiResponse.fail(404, "会话不存在")
+    return ApiResponse.ok()
+
+
+@router.post("/conversations/{conversation_id}/messages/clear")
+async def clear_conversation_messages(conversation_id: str, req: Request):
+    """
+    清空指定会话的消息历史（保留会话本身）
+
+    删除 checkpointer 中该会话的所有对话上下文，使 LLM 丧失记忆。
+    会话条目保留在侧边栏列表中，标题不变。
+    不存在时返回 ApiResponse.fail(404, ...)。
+    """
+    agent = req.app.state.agent
+    success = await agent.clear_conversation(conversation_id)
+    if not success:
+        return ApiResponse.fail(404, "会话不存在")
+    return ApiResponse.ok()
+
+
+@router.post("/conversations/{conversation_id}/messages/batch-delete")
+async def batch_delete_messages(
+    conversation_id: str, request: BatchDeleteRequest, req: Request
+):
+    """
+    批量删除消息（单条删除时传单元素数组即可）
+
+    删除最早匹配消息及其之后的所有消息（级联删除），保证对话上下文一致。
+    单条删除只需传入包含一个 ID 的数组。
+
+    Returns:
+        成功:   {"code": 1, "msg": "ok", "data": {"deleted_count": 3}}
+        失败:   会话不存在     → {"code": 404, "msg": "会话不存在"}
+                消息 ID 未匹配 → {"code": 404, "msg": "未找到匹配的消息"}
+    """
+    agent = req.app.state.agent
+    deleted_count = await agent.delete_messages(
+        conversation_id, request.message_ids
+    )
+    if deleted_count is None:
+        return ApiResponse.fail(404, "会话不存在")
+    if deleted_count == 0:
+        return ApiResponse.fail(404, "未找到匹配的消息")
+    return ApiResponse.ok({"deleted_count": deleted_count})
+
+
+@router.post("/conversations/{conversation_id}/rename")
+async def rename_conversation(conversation_id: str, request: RenameRequest, req: Request):
+    """
+    重命名指定会话
+
+    仅更新会话标题，不影响对话上下文（消息历史）。
+    不存在时返回 ApiResponse.fail(404, ...)。
+    """
+    agent = req.app.state.agent
+    success = await agent.rename_conversation(conversation_id, request.title)
+    if not success:
+        return ApiResponse.fail(404, "会话不存在")
+    return ApiResponse.ok()
+
+
+# ============================================
+# 会话顶置 / 取消顶置
+# ============================================
+@router.post("/conversations/{conversation_id}/pin")
+async def pin_conversation(conversation_id: str, req: Request):
+    """
+    顶置指定会话
+
+    将会话的 pinned_at 设置为当前时间，使其在列表中排在最前面。
+    已顶置的会话再次调用此接口会刷新顶置时间。
+    不存在时返回 ApiResponse.fail(404, ...)。
+    """
+    agent = req.app.state.agent
+    success = await agent.pin_conversation(conversation_id)
+    if not success:
+        return ApiResponse.fail(404, "会话不存在")
+    return ApiResponse.ok()
+
+
+@router.post("/conversations/{conversation_id}/unpin")
+async def unpin_conversation(conversation_id: str, req: Request):
+    """
+    取消顶置指定会话
+
+    将会话的 pinned_at 设置为空，恢复按 updated_at 排序。
+    不存在时返回 ApiResponse.fail(404, ...)。
+    """
+    agent = req.app.state.agent
+    success = await agent.unpin_conversation(conversation_id)
+    if not success:
+        return ApiResponse.fail(404, "会话不存在")
+    return ApiResponse.ok()
+
+
+# ============================================
+# 工具列表
+# ============================================
+@router.get("/tools")
+async def list_tools(req: Request):
+    """
+    获取所有可用工具列表
+
+    返回每个工具的名称、描述和参数 Schema，供前端工具选择面板使用。
+    """
+    agent = req.app.state.agent
+    return ApiResponse.ok(agent.get_tool_info_list())
+
+
+@router.post("/tools/reload")
+async def reload_tools(req: Request):
+    """
+    热重载 MCP 工具
+
+    重新读取 mcp_servers.json 配置文件，清除旧的 MCP 工具并加载新的。
+    修改 MCP 配置后调用此接口即可生效，无需重启服务。
+
+    使用场景：
+      1. 编辑 mcp_servers.json 添加/修改/删除 MCP 服务器配置
+      2. 调用 POST /api/tools/reload
+      3. 新的工具列表立即生效
+
+    Returns:
+        统一响应格式，统计数据放在 extra 字段：
+        {
+            "code": 0,
+            "msg": "ok",
+            "data": null,
+            "extra": {
+                "cleared": 2,   // 被清除的旧 MCP 工具数量
+                "loaded": 3,    // 新加载的 MCP 工具数量
+                "total": 5      // 当前工具总数（内置 + MCP）
+            }
+        }
+    """
+    agent = req.app.state.agent
+    result = await agent.reload_mcp_tools()
+    return ApiResponse.ok(extra={
+        "cleared": result["cleared"],   # 被清除的旧 MCP 工具数量
+        "loaded": result["loaded"],     # 新加载的 MCP 工具数量
+        "total": result["total"],       # 当前工具总数（内置 + MCP）
+    })
+
+
+# ============================================
+# 配置管理（LLM 大模型配置）
+# ============================================
+@router.get("/config/llm")
+async def get_llm_config():
+    """
+    获取当前 LLM 配置
+
+    读取 .env 文件中的大模型配置（API 地址、密钥、模型名称），
+    API 密钥做脱敏处理后返回（仅显示前4位和后4位）。
+
+    前端打开设置弹窗时调用此接口，用返回值填充表单。
+
+    Returns:
+        {
+            "code": 0,
+            "data": {
+                "base_url": "https://api.deepseek.com",
+                "api_key_masked": "sk-2****f8df",
+                "model_name": "deepseek-v4-flash",
+                "has_api_key": true
+            }
+        }
+
+    Raises:
+        404: .env 文件不存在
+    """
+    try:
+        config = ConfigService.get_llm_config()
+        return ApiResponse.ok(data=config.model_dump())
+    except FileNotFoundError as e:
+        return ApiResponse.fail(404, str(e))
+
+
+@router.post("/config/llm")
+async def save_llm_config(request: LlmConfigRequest):
+    """
+    保存 LLM 配置到 .env 文件
+
+    前端在设置弹窗中修改配置后点击保存时调用。
+    后端将 BASE_URL、API_KEY、MODEL_NAME 写入 .env 文件。
+
+    注意：
+      - 修改配置后需要重启后端服务才能生效
+      - api_key 为空字符串时不覆盖现有密钥
+      - .env 文件不存在时返回错误提示
+
+    Returns:
+        成功或失败的 ApiResponse
+    """
+    try:
+        ConfigService.save_llm_config(
+            base_url=request.base_url,
+            api_key=request.api_key,
+            model_name=request.model_name,
+        )
+        return ApiResponse.ok(msg="配置已保存并立即生效")
+    except FileNotFoundError as e:
+        return ApiResponse.fail(404, str(e))
+
+
+# ============================================
+# 配置管理（中间件配置）
+# ============================================
+@router.get("/config/middleware")
+async def get_middleware_config():
+    """
+    获取当前中间件配置
+
+    读取 .env 文件中的摘要压缩等中间件配置。
+    前端打开设置弹窗的"对话压缩"板块时调用此接口填充表单。
+
+    Returns:
+        {
+            "code": 0,
+            "data": {
+                "summary_enabled": false,
+                "summary_model": "",
+                "summary_max_tokens": 4000,
+                "summary_messages_to_keep": 20
+            }
+        }
+
+    Raises:
+        404: .env 文件不存在
+    """
+    try:
+        config = ConfigService.get_middleware_config()
+        return ApiResponse.ok(data=config.model_dump())
+    except FileNotFoundError as e:
+        return ApiResponse.fail(404, str(e))
+
+
+@router.post("/config/middleware")
+async def save_middleware_config(request: MiddlewareConfigRequest):
+    """
+    保存中间件配置到 .env 文件
+
+    前端在设置弹窗中修改中间件配置后点击保存时调用。
+    写入 .env 后自动热重载，下次对话即生效。
+
+    Returns:
+        成功或失败的 ApiResponse
+    """
+    try:
+        ConfigService.save_middleware_config(
+            summary_enabled=request.summary_enabled,
+            summary_model=request.summary_model,
+            summary_max_tokens=request.summary_max_tokens,
+            summary_messages_to_keep=request.summary_messages_to_keep,
+        )
+        return ApiResponse.ok(msg="中间件配置已保存并立即生效")
+    except FileNotFoundError as e:
+        return ApiResponse.fail(404, str(e))
