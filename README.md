@@ -13,6 +13,24 @@
 - **页面配置大模型**：设置面板修改 API 地址、密钥和模型名称，保存后热重载
 - **对话压缩**：长对话超过 token 阈值时自动摘要压缩，可配置
 
+## 界面预览
+
+### 主界面
+
+![主界面](README.assets/chat-home.png)
+
+### 工具选择
+
+![工具选择](README.assets/tools-panel.png)
+
+### 模型配置
+
+![模型配置](README.assets/settings-model.png)
+
+### 对话压缩
+
+![对话压缩](README.assets/settings-compression.png)
+
 ## 项目结构
 
 ```
